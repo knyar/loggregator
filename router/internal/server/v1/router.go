@@ -1,7 +1,7 @@
 package v1
 
 import (
-	"math/rand"
+	"hash/fnv"
 	"sync"
 
 	"code.cloudfoundry.org/loggregator/plumbing"
@@ -53,12 +53,6 @@ func (r *Router) Register(req *plumbing.SubscriptionRequest, dataSetter DataSett
 
 // SendTo sends an envelope for an application to all registered DataSetters.
 func (r *Router) SendTo(appID string, envelope *events.Envelope) {
-	data := r.marshal(envelope)
-
-	if data == nil {
-		return
-	}
-
 	typedFilters := r.createTypedFilters(appID, envelope)
 
 	r.lock.RLock()
@@ -66,12 +60,18 @@ func (r *Router) SendTo(appID string, envelope *events.Envelope) {
 
 	for _, typedFilter := range typedFilters {
 		for id, setters := range r.subscriptions[typedFilter] {
-			r.writeToShard(id, setters, data)
+			r.writeToShard(id, setters, envelope)
 		}
 	}
 }
 
-func (r *Router) writeToShard(id shardID, setters []DataSetter, data []byte) {
+func (r *Router) writeToShard(id shardID, setters []DataSetter, envelope *events.Envelope) {
+	data := r.marshal(envelope)
+
+	if data == nil {
+		return
+	}
+
 	if id == "" {
 		for _, setter := range setters {
 			setter.Set(data)
@@ -79,7 +79,17 @@ func (r *Router) writeToShard(id shardID, setters []DataSetter, data []byte) {
 		return
 	}
 
-	setters[rand.Intn(len(setters))].Set(data)
+	// Compute a hash based on top-level envelope values. If this results in load imbalance,
+	// we could just add values from specific event payloads here as well (like LogMessage.message
+	// or ValueMetric.name).
+	h := fnv.New32a()
+	h.Write([]byte(envelope.GetOrigin()))
+	h.Write([]byte(envelope.GetDeployment()))
+	h.Write([]byte(envelope.GetJob()))
+	h.Write([]byte(envelope.GetIndex()))
+	h.Write([]byte(envelope.GetIp()))
+
+	setters[h.Sum32()%uint32(len(setters))].Set(data)
 }
 
 func (r *Router) createTypedFilters(appID string, envelope *events.Envelope) []filter {
